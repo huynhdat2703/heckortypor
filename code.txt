@@ -1,0 +1,77 @@
+package tests.csv;
+
+import java.io.File;
+import java.io.Reader;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import org.dbunit.dataset.Column;
+import org.dbunit.dataset.DataSetException;
+import org.dbunit.dataset.DefaultTableMetaData;
+import org.dbunit.dataset.ITableMetaData;
+import org.dbunit.dataset.csv.CsvDataSetWriter;
+import org.dbunit.dataset.datatype.DataType;
+import org.dbunit.dataset.stream.IDataSetConsumer;
+import org.dbunit.dataset.stream.IDataSetProducer;
+
+import com.opencsv.CSVReader;
+
+public class CustomCsvProducer implements IDataSetProducer {
+    private LinkedHashMap<String, File> csvOrderMap;
+    private IDataSetConsumer consumer;
+
+    public CustomCsvProducer(LinkedHashMap<String, File> csvOrderMap) {
+        this.csvOrderMap = csvOrderMap;
+    }
+
+    @Override
+    public void produce() throws DataSetException {
+        try {
+            consumer.startDataSet();
+            for (String tableName : csvOrderMap.keySet()) {
+                produceFromFile(tableName, csvOrderMap.get(tableName));
+            }
+            consumer.endDataSet();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    protected void produceFromFile(String tableName, File theDataFile) throws Exception {
+        try (Reader reader = Files.newBufferedReader(Paths.get(theDataFile.getPath()));
+                CSVReader csvReader = new CSVReader(reader);) {
+            List<String[]> readData = csvReader.readAll();
+            List<String> readColumns = Arrays.asList(readData.get(0));
+            Column[] columns = IntStream.range(0, readColumns.size())
+                    .mapToObj(readColumns::get)
+                    .map(String.class::cast)
+                    .map(String::trim)
+                    .map(columnName -> new Column(columnName, DataType.UNKNOWN))
+                    .collect(Collectors.toList())
+                    .toArray(new Column[readColumns.size()]);
+            ITableMetaData metaData = new DefaultTableMetaData(tableName, columns);
+            consumer.startTable(metaData);
+            for (int i = 1; i < readData.size(); i++) {
+                List<String> rowList = Arrays.asList(readData.get(i));
+                Object[] row = rowList.toArray();
+                for (int col = 0; col < row.length; col++) {
+                    row[col] = row[col].equals(CsvDataSetWriter.NULL) ? null : row[col];
+                }
+                consumer.row(row);
+            }
+            consumer.endTable();
+        } catch (Exception e) {
+            throw new DataSetException(e);
+        }
+    }
+
+    @Override
+    public void setConsumer(IDataSetConsumer consumer) throws DataSetException {
+        this.consumer = consumer;
+    }
+}
