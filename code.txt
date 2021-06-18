@@ -1,77 +1,441 @@
-package tests.csv;
+package com.integral_core.jobtask.awsbatch.controllers;
+
+import static com.integral_core.base.utils.SyntaxSugarUtil.*;
 
 import java.io.File;
-import java.io.Reader;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.reflect.Field;
+import java.net.URL;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.LinkedHashMap;
+import java.util.HashMap;
 import java.util.List;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 
-import org.dbunit.dataset.Column;
-import org.dbunit.dataset.DataSetException;
-import org.dbunit.dataset.DefaultTableMetaData;
-import org.dbunit.dataset.ITableMetaData;
-import org.dbunit.dataset.csv.CsvDataSetWriter;
-import org.dbunit.dataset.datatype.DataType;
-import org.dbunit.dataset.stream.IDataSetConsumer;
-import org.dbunit.dataset.stream.IDataSetProducer;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
-import com.opencsv.CSVReader;
+import com.amazonaws.util.json.Jackson;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.util.ClassUtil;
+import com.google.common.base.CaseFormat;
+import com.google.inject.Inject;
+import com.iciql.Db;
+import com.integral_core.base.dtos.SnsMessageDto;
+import com.integral_core.base.enums.JOB_RESULT_STATUS;
+import com.integral_core.base.enums.SEPARATOR;
+import com.integral_core.base.enums.TASK_PROCESS_STATUS;
+import com.integral_core.base.utils.SnsUtil;
+import com.integral_core.jobtask.awsbatch.dtos.ExecResultValuesDto;
+import com.integral_core.jobtask.awsbatch.enums.ERROR_MESSAGE_TYPE;
+import com.integral_core.jobtask.awsbatch.enums.TASK_TYPE;
+import com.integral_core.jobtask.awsbatch.models.MBiConnectSettingModel;
+import com.integral_core.jobtask.awsbatch.models.MJobSettingModel;
+import com.integral_core.jobtask.awsbatch.models.MJobTaskSettingModel;
+import com.integral_core.jobtask.awsbatch.models.TJobExecHistoryModel;
+import com.integral_core.jobtask.awsbatch.models.TJobTaskExecHistoryModel;
+import com.integral_core.jobtask.awsbatch.models.redshift.SegmentModel;
+import com.integral_core.jobtask.awsbatch.services.CreateYamlService;
+import com.integral_core.jobtask.awsbatch.services.CsvFileProcessingProcessService;
+import com.integral_core.jobtask.awsbatch.services.EmbulkService;
+import com.integral_core.jobtask.awsbatch.services.ExecHistoryManageService;
+import com.integral_core.jobtask.awsbatch.services.ExecuteIoService;
+import com.integral_core.jobtask.awsbatch.services.ExecuteSQLService;
+import com.integral_core.jobtask.awsbatch.services.SegmentService;
+import com.integral_core.jobtask.awsbatch.services.SqlFileProcessService;
+import com.integral_core.jobtask.awsbatch.services.TemplateService;
+import com.integral_core.jobtask.awsbatch.utils.ConnectionUtil;
+import com.integral_core.jobtask.awsbatch.utils.DirectoryUtil;
+import com.integral_core.jobtask.awsbatch.utils.IciqlUtil;
+import com.integral_core.jobtask.awsbatch.utils.ValiableUtil;
+import com.integral_core.jobtask_library.dtos.IOTaskDto;
+import com.integral_core.jobtask_library.dtos.IOTaskDto.EtlInputDto;
+import com.integral_core.jobtask_library.dtos.IOTaskDto.EtlInputDto.InputSegmentDto;
+import com.integral_core.jobtask_library.dtos.IOTaskDto.EtlOutputDto;
+import com.integral_core.jobtask_library.dtos.IOTaskDto.EtlOutputDto.OutputWebhookDto;
 
-public class CustomCsvProducer implements IDataSetProducer {
-    private LinkedHashMap<String, File> csvOrderMap;
-    private IDataSetConsumer consumer;
+import lombok.NonNull;
 
-    public CustomCsvProducer(LinkedHashMap<String, File> csvOrderMap) {
-        this.csvOrderMap = csvOrderMap;
+public class JobTaskExecuteController extends BaseController {
+  private final ExecHistoryManageService execHistoryManageService;
+
+  private final ExecuteIoService executeIoService;
+  private final CreateYamlService createYamlService;
+  private final EmbulkService embulkService;
+  private final CsvFileProcessingProcessService csvFileProcessingProcessService;
+  private final SqlFileProcessService sqlFileProcessService;
+  private final ExecuteSQLService executeSQLService;
+  private final TemplateService templateService;
+  private final SegmentService segmentService;
+
+  private static final Logger LOGGER = LogManager.getLogger(MethodHandles.lookup().lookupClass());
+
+  // job_task処理に利用するディレクトリ
+  private List<String> directories = Arrays.asList(
+    S(SEPARATOR.SLASH, getCurrentPath(), CONFIG.getString("dlFileDir.csv")),
+    S(SEPARATOR.SLASH, getCurrentPath(), CONFIG.getString("dlFileDir.json")),
+    S(SEPARATOR.SLASH, getCurrentPath(), CONFIG.getString("dlFileDir.yaml.template")));
+
+  @Inject
+  public JobTaskExecuteController(
+    ExecHistoryManageService execHistoryManageService,
+    ExecuteIoService executeIoService,
+    CreateYamlService createYamlService,
+    EmbulkService embulkService,
+    CsvFileProcessingProcessService csvFileProcessingProcessService,
+    ExecuteSQLService executeSQLService,
+    SqlFileProcessService sqlFileProcessService,
+    TemplateService templateService,
+    SegmentService segmentService) {
+    this.execHistoryManageService = execHistoryManageService;
+    this.executeIoService = executeIoService;
+    this.createYamlService = createYamlService;
+    this.embulkService = embulkService;
+    this.csvFileProcessingProcessService = csvFileProcessingProcessService;
+    this.executeSQLService = executeSQLService;
+    this.sqlFileProcessService = sqlFileProcessService;
+    this.templateService = templateService;
+    this.segmentService = segmentService;
+  }
+
+  /**
+   * ジョブタスク機能の実行メインロジック
+   *
+   * @param jobExecHistoryIdListStr 実行対象のジョブ実行履歴ID
+   * @throws JsonProcessingException ジョブIDリスト文字列が変換不可だった場合の例外
+   */
+  public void execute(@NonNull String jobExecHistoryIdListStr) throws JsonProcessingException {
+    List<Long> jobExecHistoryIdList = execHistoryManageService.convertIdListFromStr(jobExecHistoryIdListStr);
+
+    // ジョブ実行履歴IDの有効性を検証し、実行可能ならそこから契約企業IDを拾う
+    long contractCompanyId = execHistoryManageService.getValidJobExecHistoryList(jobExecHistoryIdList)
+      .get(0).getContractCompanyId();
+
+    execute(jobExecHistoryIdList, contractCompanyId);
+  }
+
+  /**
+   * ジョブタスク機能の実行メインロジック
+   *
+   * @param jobHistIdList     実行対象のジョブ実行履歴ID
+   * @param contractCompanyId 契約企業ID
+   */
+  public void execute(List<Long> jobHistIdList, Long contractCompanyId) {
+    LOGGER.info("プロセス実行開始. 実行対象job履歴ID一覧: {}.", jobHistIdList);
+
+    List<Long> unprocessedJobHistoryList = null;
+    try (Db db = IciqlUtil.getAuroraConnection()) {
+      // IOタスク処理に必要なディレクトリが無ければ作成
+      DirectoryUtil.createNotExistDirectories(directories);
+
+      // 呼び出し元から渡された履歴IDリストに対応する履歴取得
+      List<TJobExecHistoryModel> jobExecHistories = execHistoryManageService.getValidJobExecHistories(
+        db, contractCompanyId, jobHistIdList);
+      if (jobExecHistories.isEmpty()) {
+        return;
+      }
+
+      // Exception発生時にJOB実行履歴テーブルのステータスを失敗に変更するために、JOB実行履歴テーブルIDをコピー
+      unprocessedJobHistoryList = new ArrayList<>(jobHistIdList);
+
+      // 有効なジョブ実行履歴分だけジョブを実行
+      for (TJobExecHistoryModel jobExecHistory : jobExecHistories) {
+        executeJob(contractCompanyId, jobExecHistory, unprocessedJobHistoryList, db);
+      }
+
+    } catch (IOException | RuntimeException e) {
+      LOGGER.error("プロセス実行中にエラーが発生しました. 契約企業ID -> {}. エラー内容 -> {}", contractCompanyId, e.getMessage());
+      SnsUtil.issueTopic(new SnsMessageDto(
+        contractCompanyId, ERROR_MESSAGE_TYPE.SYSTEM.getValue(), this.getClass().getName(),
+        "プロセス実行中にエラーが発生しました. e = [ " + e.getMessage() + " ]."));
+
+      // 実行が終わっていないジョブを全て失敗に倒す
+      try (Db db = IciqlUtil.getAuroraConnection()) {
+        execHistoryManageService.updateStatusJobExecHistories(
+          db, JOB_RESULT_STATUS.FAIL, unprocessedJobHistoryList, ERROR_MESSAGE_TYPE.SYSTEM.getValue());
+      }
+    }
+  }
+
+  /**
+   * ジョブ実行
+   *
+   * @param contractCompanyId         契約企業ID
+   * @param jobExecHistory            ジョブ実行履歴
+   * @param unprocessedJobHistoryList 未処理のジョブ履歴リスト
+   * @param db                        Iciqlの接続インスタンス
+   */
+  private void executeJob(
+    long contractCompanyId,
+    @NonNull TJobExecHistoryModel jobExecHistory,
+    @NonNull List<Long> unprocessedJobHistoryList,
+    @NonNull Db db) {
+    long jobExecHistId = jobExecHistory.getJobExecHistoryId();
+
+    // ジョブ実行履歴ID指定で「実行中」にステータス変更
+    LOGGER.info("Job実行処理開始. 実行対象Job履歴ID: {}", jobExecHistId);
+    execHistoryManageService.updateStatusJobExecHistory(db, JOB_RESULT_STATUS.PROCESSING, jobExecHistId, null);
+
+    // ジョブ設定を取得
+    MJobSettingModel mJobSettingModel = execHistoryManageService.getJobSettingByJobExecHistory(db, jobExecHistory);
+    if (Objects.isNull(mJobSettingModel)) {
+      LOGGER.warn("ジョブ設定が存在しないため処理をスキップ 契約企業ID -> {}", contractCompanyId);
+      execHistoryManageService.updateStatusJobExecHistory(
+        db, JOB_RESULT_STATUS.FAIL, jobExecHistId, ERROR_MESSAGE_TYPE.JOB_SETTING_NOT_FOUND.getValue());
+      return;
+    }
+    LOGGER.info("実行対象JobID: {}. 実行対象Job名称: {}.", mJobSettingModel.getJobSettingId(), mJobSettingModel.getJobName());
+
+    // ジョブ設定IDに紐づいたタスクを取得
+    List<MJobTaskSettingModel> taskList = execHistoryManageService.getJobTaskSettingListByJobSettingId(
+      db, mJobSettingModel.jobSettingId);
+    if (Objects.isNull(taskList) || taskList.isEmpty()) {
+      LOGGER.warn("タスクが存在しないため処理をスキップ 契約企業ID -> {}", contractCompanyId);
+      execHistoryManageService.updateStatusJobExecHistory(
+        db, JOB_RESULT_STATUS.FAIL, jobExecHistId, ERROR_MESSAGE_TYPE.TASK_SETTING_NOT_FOUND.getValue());
+      return;
     }
 
-    @Override
-    public void produce() throws DataSetException {
-        try {
-            consumer.startDataSet();
-            for (String tableName : csvOrderMap.keySet()) {
-                produceFromFile(tableName, csvOrderMap.get(tableName));
-            }
-            consumer.endDataSet();
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+    // 取得したタスク設定に対応する実行履歴を作成
+    List<Long> insertedJobTaskHistoryIdList = execHistoryManageService.createJobTaskExecHistoryByTaskList(
+      db, taskList, jobExecHistId);
+
+    ExecResultValuesDto execResults = new ExecResultValuesDto();
+    for (MJobTaskSettingModel task : taskList) {
+      // 途中一つでも失敗したら以降の処理はスキップ
+      if (execResults.getJobExecMessage() != null) {
+        LOGGER.info("JobTaskスキップ. 対象JobTaskID: {}. 対象JobTask名称: {}",
+          task.getJobTaskSettingId(), task.getJobTaskName());
+        execHistoryManageService
+          .updateStatusJobTaskExecHistories(db, insertedJobTaskHistoryIdList, task.jobTaskSettingId,
+            TASK_PROCESS_STATUS.SKIP, ERROR_MESSAGE_TYPE.SKIP_TASK.getValue());
+        continue;
+      }
+
+      executeTask(contractCompanyId, task, insertedJobTaskHistoryIdList, execResults, db);
+    }
+
+    if (execResults.getJobExecMessage() == null) {
+      execHistoryManageService.updateStatusJobExecHistory(
+        db, JOB_RESULT_STATUS.SUCCESS, jobExecHistory.getJobExecHistoryId(), null);
+      LOGGER.info("Job実行処理正常終了");
+    } else {
+      execHistoryManageService
+        .updateStatusJobExecHistory(db, JOB_RESULT_STATUS.FAIL, jobExecHistId,
+          Objects.nonNull(execResults.getJobExecMessage()) ? execResults.getJobExecMessage()
+            : ERROR_MESSAGE_TYPE.SYSTEM.getValue());
+      LOGGER.warn("Job実行処理異常終了 契約企業ID -> {}", contractCompanyId);
+    }
+
+    // 例外を発生させずに処理が終わった履歴は一括失敗更新リストから削除
+    unprocessedJobHistoryList.remove(jobExecHistId);
+  }
+
+  /**
+   * タスクの実行
+   *
+   * @param contractCompanyId            契約企業ID
+   * @param task                         タスク
+   * @param insertedJobTaskHistoryIdList 実行待ちタスク実行履歴のリスト
+   * @param execResults                  実行結果マッピング用Dto
+   * @param auroraDb                     Iciqlの接続インスタンス
+   * @return タスク実行成否
+   */
+  public void executeTask(
+    long contractCompanyId,
+    @NonNull MJobTaskSettingModel task,
+    @NonNull List<Long> insertedJobTaskHistoryIdList,
+    @NonNull ExecResultValuesDto execResults,
+    @NonNull Db auroraDb) {
+    LOGGER.info("JobTask実行処理開始. 実行対象JobTaskID: {}. 実行対象JobTask名称: {}.",
+      task.getJobTaskSettingId(), task.getJobTaskName());
+    boolean taskResult = true;
+
+    // taskId指定で「実行中」で更新
+    execHistoryManageService.updateStatusJobTaskExecHistories(auroraDb, insertedJobTaskHistoryIdList,
+      task.jobTaskSettingId,
+      TASK_PROCESS_STATUS.EXECUTING, null);
+
+    // 実行中タスクに合致するタスク実行履歴を、作成した履歴リストの中から取得
+    TJobTaskExecHistoryModel taskHistModel = execHistoryManageService
+      .getJobTaskExecHistoriesBySettingIdAndHistory(auroraDb, task.jobTaskSettingId, insertedJobTaskHistoryIdList);
+    LOGGER.info("実行対象JobTask履歴ID: {}", Objects.requireNonNull(taskHistModel).getJobTaskExecHistoryId());
+    long jobTaskExecHistId = taskHistModel.jobTaskExecHistoryId;
+
+    TASK: try {
+      if (task.jobTaskType.equals(TASK_TYPE.IN_OUT.getValue())) {
+        // IOタスク生成
+        IOTaskDto iOTask = executeIoService.generateIOTask(contractCompanyId, task, execResults);
+        iOTask.setContractCompanyId(contractCompanyId);
+        LOGGER.info("iOTask -> {}", Jackson.toJsonPrettyString(iOTask));
+
+        // If an input-task-type is the segment and an output-task-type is the webhook, do independent processing.
+        if (iOTask.isInputSegment() && iOTask.isOutputWebhook()) {
+          MBiConnectSettingModel mBiConnectSettingModel =
+            executeSQLService.fetchMBiConnectSettingModel(auroraDb, contractCompanyId);
+          if (mBiConnectSettingModel == null) {
+            throw new RuntimeException(
+              "mBiConnectSettingModel is not found. contractCompanyId -> " + contractCompanyId);
+          }
+          try (Db biRedshiftDb = IciqlUtil.getRedshiftConnectionFromParam(mBiConnectSettingModel.getHost(),
+            mBiConnectSettingModel.getPort(), mBiConnectSettingModel.getUserName(),
+            mBiConnectSettingModel.getPassword(), mBiConnectSettingModel.getDatabase())) {
+            IOTaskDto.EtlInputDto.InputSegmentDto inputSegmentDto = Optional.ofNullable(iOTask)
+              .map(IOTaskDto::getInput)
+              .map(EtlInputDto::getInputSegment)
+              .orElseThrow(() -> new RuntimeException("InputSegment is not found."));
+            IOTaskDto.EtlOutputDto.OutputWebhookDto outputWebhookDto = Optional.ofNullable(iOTask)
+              .map(IOTaskDto::getOutput)
+              .map(EtlOutputDto::getOutputWebhook)
+              .orElseThrow(() -> new RuntimeException("OutputWebhook is not found."));
+            this.executeTaskFromSegmentToWebhook(auroraDb, biRedshiftDb, contractCompanyId, inputSegmentDto,
+              outputWebhookDto);
+            taskResult = true;
+          }
+          break TASK;
         }
-    }
 
-    protected void produceFromFile(String tableName, File theDataFile) throws Exception {
-        try (Reader reader = Files.newBufferedReader(Paths.get(theDataFile.getPath()));
-                CSVReader csvReader = new CSVReader(reader);) {
-            List<String[]> readData = csvReader.readAll();
-            List<String> readColumns = Arrays.asList(readData.get(0));
-            Column[] columns = IntStream.range(0, readColumns.size())
-                    .mapToObj(readColumns::get)
-                    .map(String.class::cast)
-                    .map(String::trim)
-                    .map(columnName -> new Column(columnName, DataType.UNKNOWN))
-                    .collect(Collectors.toList())
-                    .toArray(new Column[readColumns.size()]);
-            ITableMetaData metaData = new DefaultTableMetaData(tableName, columns);
-            consumer.startTable(metaData);
-            for (int i = 1; i < readData.size(); i++) {
-                List<String> rowList = Arrays.asList(readData.get(i));
-                Object[] row = rowList.toArray();
-                for (int col = 0; col < row.length; col++) {
-                    row[col] = row[col].equals(CsvDataSetWriter.NULL) ? null : row[col];
-                }
-                consumer.row(row);
-            }
-            consumer.endTable();
-        } catch (Exception e) {
-            throw new DataSetException(e);
+        if (iOTask.isOutputWebhook()) {
+          throw new RuntimeException("The webhook can not be used without the segment.");
         }
+
+        // Inputがクラウドストレージの場合は先に処理
+        if (iOTask.isInputCloudStorage()) {
+          taskResult =
+            executeIoService.executeIOToCloudStorage(contractCompanyId, iOTask, jobTaskExecHistId, execResults);
+        }
+
+        // I/O両方がクラウドストレージならばEmbulkの起動の必要は無いため、実行成否とOutput先を確認する
+        if (taskResult && !(iOTask.isInputCloudStorage() && iOTask.isOutputCloudStorage())) {
+          // CSVの文字コードをUTF-8に、改行コードをLFに加工
+          csvFileProcessingProcessService.convertInputCsv();
+          // Embulk実行用のYamlを生成
+          boolean yamlFileCreated = createYamlService.createYamlFile(iOTask, execResults);
+          if (!yamlFileCreated) {
+            throw new RuntimeException("YAMLファイルの生成に失敗しました。");
+          }
+          File yamlFile = createYamlService.extractProcessedYamlFile();
+          if (yamlFile == null) {
+            throw new FileNotFoundException("The target yaml file is not found.");
+          }
+
+          // EmbulkのTruncate/Insertを使用しないようにするため、独自のTruncateを経由
+          executeIoService.truncateTableIfModeIsTruncateInsert(iOTask.getOutput());
+          // Embulkを実行
+          taskResult = embulkService.executeEmbulk(contractCompanyId, jobTaskExecHistId, execResults);
+        }
+
+      } else if (TASK_TYPE.SQL.getValue().equals(task.jobTaskType)) {
+        if (task.getJobTaskCommand() == null) {
+          execResults.setJobExecMessage(ERROR_MESSAGE_TYPE.QUERY_FORMAT.getValue());
+          throw new RuntimeException("実行対象のクエリが存在しません.");
+        }
+        // 変数置換
+        String commandAppliedVariables = ValiableUtil.applyVariables(
+          task.getJobTaskCommand(), task.getJobSettingId(), task.getJobTaskSettingId(), LocalDateTime.now());
+        // SQLタスク実行
+        taskResult = executeSQLService.executeSql(contractCompanyId, commandAppliedVariables, execResults);
+      }
+    } catch (Exception e) {
+      LOGGER.warn("JobTask実行時例外発生. 契約企業ID -> {}. エラー内容 -> {}", contractCompanyId, e.getMessage());
+      taskResult = false;
+      SnsUtil.issueTopic(new SnsMessageDto(contractCompanyId, ERROR_MESSAGE_TYPE.SYSTEM.getValue(),
+        this.getClass().getName(), "JobTask実行中にエラーが発生しました. e = [ " + e.getMessage() + " ]."));
     }
 
-    @Override
-    public void setConsumer(IDataSetConsumer consumer) throws DataSetException {
-        this.consumer = consumer;
+    // 処理終了. タスク実行結果によってステータスを更新
+    if (taskResult) {
+      // ステータスを「成功」に更新
+      execHistoryManageService.updateStatusJobTaskExecHistories(
+        auroraDb, insertedJobTaskHistoryIdList, task.jobTaskSettingId, TASK_PROCESS_STATUS.SUCCESS, null);
+      LOGGER.info("JobTask実行処理正常終了");
+    } else {
+      // ステータスを「失敗」に更新
+      execHistoryManageService.updateStatusJobTaskExecHistories(
+        auroraDb, insertedJobTaskHistoryIdList, task.jobTaskSettingId, TASK_PROCESS_STATUS.FAIL,
+        Objects.nonNull(execResults.getJobExecMessage()) ? execResults.getJobExecMessage()
+          : ERROR_MESSAGE_TYPE.SYSTEM.getValue());
+      LOGGER.warn("JobTask実行処理異常終了. 契約企業ID -> {}", contractCompanyId);
     }
+  }
+
+  /**
+   * To execute task from the Segment to the Webhook.
+   *
+   * @param auroraDb          An instance of Db for Aurora
+   * @param biRedshiftDb      An instance of Db for BiRedshift
+   * @param contractCompanyId An id of MContractCompany on Aurora
+   * @param inputSegmentDto   An instance of InputSegmentDto
+   * @param outputWebhookDto  An instance of OutputWebhookDto
+   * @throws IOException
+   */
+  protected void executeTaskFromSegmentToWebhook(@NonNull Db auroraDb, @NonNull Db biRedshiftDb,
+    @NonNull Long contractCompanyId, @NonNull IOTaskDto.EtlInputDto.InputSegmentDto inputSegmentDto,
+    @NonNull IOTaskDto.EtlOutputDto.OutputWebhookDto outputWebhookDto) throws IOException {
+    Long segmentId = Optional.ofNullable(inputSegmentDto)
+      .map(InputSegmentDto::getSegmentId)
+      .orElseThrow(() -> new RuntimeException("SegmentId is not found on InputSegment."));
+    String url = Optional.ofNullable(outputWebhookDto)
+      .map(OutputWebhookDto::getUrl)
+      .orElseThrow(() -> new RuntimeException("Url for payload is not found on OutputWebhook."));
+    String method = Optional.ofNullable(outputWebhookDto)
+      .map(OutputWebhookDto::getMethod)
+      .orElseThrow(() -> new RuntimeException("Method for payload is not found on OutputWebhook."));
+    Map<String, String> headerMap = Optional.ofNullable(outputWebhookDto)
+      .map(OutputWebhookDto::getHeader)
+      .orElse(new HashMap<>());
+    String template = Optional.ofNullable(outputWebhookDto)
+      .map(OutputWebhookDto::getPayload)
+      .orElseThrow(() -> new RuntimeException("Template for payload is not found on OutputWebhook."));
+    Long maxRequestBodySize = Optional.ofNullable(outputWebhookDto)
+      .map(OutputWebhookDto::getMaxRequestBodySize)
+      .orElse(null);
+    SegmentModel segmentModel = segmentService.fetchSegmentModelFromRedshift(auroraDb, segmentId);
+    if (segmentModel == null) {
+      throw new RuntimeException("segmentModel is not found. segmentId -> " + segmentId);
+    }
+    String query = sqlFileProcessService.createSqlForInputSegmentDto(biRedshiftDb, inputSegmentDto, false);
+    ExecResultValuesDto execResultValuesDto = new ExecResultValuesDto(true);
+    boolean isSuccess = executeSQLService.executeSql(contractCompanyId, query, execResultValuesDto);
+    if (!isSuccess || execResultValuesDto.getResultList() == null) {
+      if (execResultValuesDto.getJobExecMessage() != null) {
+        LOGGER.error("Some error is caught. e -> {}", execResultValuesDto.getJobExecMessage());
+      }
+      throw new RuntimeException("SQL Execution is failed about the Segment.");
+    }
+
+    // To change columns on segment from camel-case to snake-case.
+    Map<String, Object> segmentMap = new HashMap<>();
+    for (Field field : ClassUtil.getDeclaredFields(SegmentModel.class)) {
+      boolean isAccessible = field.isAccessible();
+      try {
+        field.setAccessible(true);
+        segmentMap.put(CaseFormat.UPPER_CAMEL.to(CaseFormat.LOWER_UNDERSCORE, field.getName()),
+          field.get(segmentModel));
+      } catch (IllegalArgumentException | IllegalAccessException e) {
+        LOGGER.warn("Some error is caught. e -> {}", e.getMessage(), e);
+      } finally {
+        field.setAccessible(isAccessible);
+      }
+    }
+
+    String requestBody = templateService.buildStringFromTemplate(template, new HashMap<String, Object>() {
+      {
+        this.put("records", execResultValuesDto.getResultList());
+        this.put("segment", segmentModel);
+      }
+    });
+    if (maxRequestBodySize != null && requestBody.getBytes().length > maxRequestBodySize.longValue()) {
+      throw new RuntimeException("requestBody exceeded maxRequestBodySize.");
+    }
+    int statusCode = ConnectionUtil.sendRequest(new URL(url), method, headerMap, requestBody);
+    if (statusCode != 200) {
+      throw new RuntimeException("statusCode is not 200. statusCode -> " + statusCode);
+    }
+  }
 }
